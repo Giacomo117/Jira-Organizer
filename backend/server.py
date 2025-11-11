@@ -1,7 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
@@ -9,18 +8,18 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 import json
 import aiohttp
 from base64 import b64encode
+from openai import AsyncOpenAI
+import aiosqlite
+import asyncio
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Database path
+DB_PATH = ROOT_DIR / 'jira_organizer.db'
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -35,11 +34,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== Database Setup ====================
+
+async def init_db():
+    """Initialize SQLite database with required tables"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Jira configurations table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS jira_configs (
+                id TEXT PRIMARY KEY,
+                jira_domain TEXT NOT NULL,
+                jira_email TEXT NOT NULL,
+                jira_api_token TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        ''')
+
+        # Meeting analyses table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS meeting_analyses (
+                id TEXT PRIMARY KEY,
+                jira_project_key TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                meeting_minutes TEXT NOT NULL,
+                proposed_changes TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                processed_at TEXT
+            )
+        ''')
+
+        await db.commit()
+        logger.info(f"Database initialized at {DB_PATH}")
+
 # ==================== Models ====================
 
 class JiraConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     jira_domain: str  # e.g., "yourcompany.atlassian.net"
     jira_email: str
@@ -67,7 +100,7 @@ class ProposedTicket(BaseModel):
 
 class MeetingAnalysis(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     jira_project_key: str
     client_name: str
@@ -101,18 +134,18 @@ class JiraAPIClient:
         self.base_url = f"https://{domain}/rest/api/3"
         self.email = email
         self.api_token = api_token
-        
+
         # Create basic auth header
         auth_str = f"{email}:{api_token}"
         auth_bytes = auth_str.encode('ascii')
         auth_b64 = b64encode(auth_bytes).decode('ascii')
-        
+
         self.headers = {
             "Authorization": f"Basic {auth_b64}",
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-    
+
     async def test_connection(self) -> bool:
         """Test the connection to Jira"""
         try:
@@ -125,14 +158,14 @@ class JiraAPIClient:
         except Exception as e:
             logger.error(f"Jira connection test failed: {e}")
             return False
-    
+
     async def get_project_tickets(self, project_key: str) -> List[Dict[str, Any]]:
         """Fetch all tickets for a project"""
         try:
             all_tickets = []
             start_at = 0
             max_results = 100
-            
+
             async with aiohttp.ClientSession() as session:
                 while True:
                     jql = f"project={project_key}"
@@ -142,7 +175,7 @@ class JiraAPIClient:
                         "maxResults": max_results,
                         "fields": "summary,description,status,issuetype,key"
                     }
-                    
+
                     async with session.get(
                         f"{self.base_url}/search",
                         headers=self.headers,
@@ -151,22 +184,22 @@ class JiraAPIClient:
                         if response.status != 200:
                             logger.error(f"Failed to fetch tickets: {response.status}")
                             break
-                        
+
                         data = await response.json()
                         issues = data.get('issues', [])
                         all_tickets.extend(issues)
-                        
+
                         # Check if there are more results
                         if len(issues) < max_results:
                             break
-                        
+
                         start_at += max_results
-            
+
             return all_tickets
         except Exception as e:
             logger.error(f"Error fetching project tickets: {e}")
             return []
-    
+
     async def create_ticket(self, project_key: str, issue_type: str, summary: str, description: str) -> Optional[str]:
         """Create a new Jira ticket"""
         try:
@@ -192,7 +225,7 @@ class JiraAPIClient:
                     "issuetype": {"name": issue_type}
                 }
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self.base_url}/issue",
@@ -209,7 +242,7 @@ class JiraAPIClient:
         except Exception as e:
             logger.error(f"Error creating ticket: {e}")
             return None
-    
+
     async def update_ticket(self, ticket_key: str, summary: Optional[str] = None, description: Optional[str] = None) -> bool:
         """Update an existing Jira ticket"""
         try:
@@ -232,9 +265,9 @@ class JiraAPIClient:
                         }
                     ]
                 }
-            
+
             payload = {"fields": fields}
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.put(
                     f"{self.base_url}/issue/{ticket_key}",
@@ -249,14 +282,14 @@ class JiraAPIClient:
 # ==================== LLM Analysis Service ====================
 
 async def analyze_meeting_with_llm(meeting_minutes: str, project_key: str, existing_tickets: List[Dict]) -> List[ProposedTicket]:
-    """Use LLM to analyze meeting minutes and propose Jira changes"""
+    """Use OpenRouter (GPT-4o) to analyze meeting minutes and propose Jira changes"""
     try:
         # Format existing tickets for the LLM
         tickets_summary = "\n".join([
             f"- {ticket['key']}: [{ticket['fields']['issuetype']['name']}] {ticket['fields']['summary']}\n  Description: {ticket['fields'].get('description', {}).get('content', [{}])[0].get('content', [{}])[0].get('text', 'No description')[:200]}"
             for ticket in existing_tickets[:50]  # Limit to avoid token overflow
         ])
-        
+
         system_message = """You are a Jira project management assistant. Your task is to analyze meeting minutes and compare them with existing Jira tickets to identify:
 1. New tasks, stories, or bugs that should be created
 2. Existing tickets that need to be updated based on meeting decisions
@@ -274,7 +307,7 @@ You must respond ONLY with a valid JSON array of proposed changes. Each change m
 }
 
 IMPORTANT: Respond with ONLY a JSON array, no additional text or explanation."""
-        
+
         user_prompt = f"""Project: {project_key}
 
 Existing Tickets:
@@ -284,64 +317,79 @@ Meeting Minutes:
 {meeting_minutes}
 
 Analyze the meeting minutes and propose changes as a JSON array."""
-        
-        # Initialize LLM chat
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message=system_message
-        ).with_model("openai", "gpt-4o")
-        
-        # Send message
-        user_message = UserMessage(text=user_prompt)
-        response = await chat.send_message(user_message)
-        
-        logger.info(f"LLM Response: {response}")
-        
+
+        # Initialize OpenRouter client
+        client = AsyncOpenAI(
+            api_key=os.environ.get('OPENROUTER_API_KEY'),
+            base_url="https://openrouter.ai/api/v1"
+        )
+
+        model_name = os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o')
+        logger.info(f"Calling OpenRouter with model: {model_name}")
+
+        # Send message to OpenRouter
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=4000
+        )
+
+        response_text = response.choices[0].message.content
+        logger.info(f"OpenRouter Response: {response_text[:500]}...")
+
         # Parse response
         # Remove markdown code blocks if present
-        response_text = response.strip()
         if response_text.startswith("```"):
             lines = response_text.split("\n")
             response_text = "\n".join(lines[1:-1]) if len(lines) > 2 else response_text
             response_text = response_text.replace("```json", "").replace("```", "")
-        
-        proposals_data = json.loads(response_text)
-        
+
+        proposals_data = json.loads(response_text.strip())
+
         # Convert to ProposedTicket objects
         proposals = [ProposedTicket(**item) for item in proposals_data]
-        
+
+        logger.info(f"Generated {len(proposals)} proposals")
         return proposals
-    
+
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse LLM response as JSON: {e}")
-        logger.error(f"Response was: {response}")
+        logger.error(f"Response was: {response_text if 'response_text' in locals() else 'No response'}")
         return []
     except Exception as e:
-        logger.error(f"Error in LLM analysis: {e}")
+        logger.error(f"Error in OpenRouter API call: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 # ==================== API Routes ====================
 
 @api_router.get("/")
 async def root():
-    return {"message": "Jira Meeting Sync API"}
+    return {"message": "Jira Meeting Sync API", "status": "running"}
 
 # Jira Configuration endpoints
 @api_router.post("/jira/config")
 async def save_jira_config(config: JiraConfigCreate):
     """Save Jira configuration"""
     try:
-        # Delete existing config (single-user setup)
-        await db.jira_configs.delete_many({})
-        
-        config_obj = JiraConfig(**config.model_dump())
-        doc = config_obj.model_dump()
-        doc['created_at'] = doc['created_at'].isoformat()
-        
-        await db.jira_configs.insert_one(doc)
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Delete existing config (single-user setup)
+            await db.execute('DELETE FROM jira_configs')
+
+            config_obj = JiraConfig(**config.model_dump())
+
+            await db.execute(
+                'INSERT INTO jira_configs (id, jira_domain, jira_email, jira_api_token, created_at) VALUES (?, ?, ?, ?, ?)',
+                (config_obj.id, config_obj.jira_domain, config_obj.jira_email,
+                 config_obj.jira_api_token, config_obj.created_at.isoformat())
+            )
+            await db.commit()
+
         return {"success": True, "message": "Jira configuration saved successfully"}
     except Exception as e:
         logger.error(f"Error saving Jira config: {e}")
@@ -351,17 +399,20 @@ async def save_jira_config(config: JiraConfigCreate):
 async def get_jira_config():
     """Get saved Jira configuration (without API token for security)"""
     try:
-        config = await db.jira_configs.find_one({}, {"_id": 0})
-        
-        if not config:
-            return {"configured": False}
-        
-        # Don't return the API token
-        return {
-            "configured": True,
-            "jira_domain": config.get('jira_domain'),
-            "jira_email": config.get('jira_email')
-        }
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM jira_configs LIMIT 1') as cursor:
+                row = await cursor.fetchone()
+
+                if not row:
+                    return {"configured": False}
+
+                # Don't return the API token
+                return {
+                    "configured": True,
+                    "jira_domain": row['jira_domain'],
+                    "jira_email": row['jira_email']
+                }
     except Exception as e:
         logger.error(f"Error fetching Jira config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -370,26 +421,29 @@ async def get_jira_config():
 async def test_jira_connection():
     """Test connection to Jira"""
     try:
-        config = await db.jira_configs.find_one({}, {"_id": 0})
-        
-        if not config:
-            return JiraConnectionTest(
-                success=False,
-                message="No Jira configuration found. Please configure Jira first."
-            )
-        
-        jira_client = JiraAPIClient(
-            domain=config['jira_domain'],
-            email=config['jira_email'],
-            api_token=config['jira_api_token']
-        )
-        
-        success = await jira_client.test_connection()
-        
-        return JiraConnectionTest(
-            success=success,
-            message="Successfully connected to Jira!" if success else "Failed to connect to Jira. Please check your credentials."
-        )
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM jira_configs LIMIT 1') as cursor:
+                row = await cursor.fetchone()
+
+                if not row:
+                    return JiraConnectionTest(
+                        success=False,
+                        message="No Jira configuration found. Please configure Jira first."
+                    )
+
+                jira_client = JiraAPIClient(
+                    domain=row['jira_domain'],
+                    email=row['jira_email'],
+                    api_token=row['jira_api_token']
+                )
+
+                success = await jira_client.test_connection()
+
+                return JiraConnectionTest(
+                    success=success,
+                    message="Successfully connected to Jira!" if success else "Failed to connect to Jira. Please check your credentials."
+                )
     except Exception as e:
         logger.error(f"Error testing Jira connection: {e}")
         return JiraConnectionTest(
@@ -403,58 +457,86 @@ async def create_analysis(analysis_request: MeetingAnalysisCreate):
     """Create a new meeting analysis"""
     try:
         # Get Jira config
-        config = await db.jira_configs.find_one({}, {"_id": 0})
-        if not config:
-            raise HTTPException(status_code=400, detail="Jira not configured")
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM jira_configs LIMIT 1') as cursor:
+                config_row = await cursor.fetchone()
+
+                if not config_row:
+                    raise HTTPException(status_code=400, detail="Jira not configured")
+
         # Initialize Jira client
         jira_client = JiraAPIClient(
-            domain=config['jira_domain'],
-            email=config['jira_email'],
-            api_token=config['jira_api_token']
+            domain=config_row['jira_domain'],
+            email=config_row['jira_email'],
+            api_token=config_row['jira_api_token']
         )
-        
+
         # Fetch existing tickets
+        logger.info(f"Fetching tickets for project: {analysis_request.jira_project_key}")
         existing_tickets = await jira_client.get_project_tickets(analysis_request.jira_project_key)
-        
+        logger.info(f"Found {len(existing_tickets)} existing tickets")
+
         # Analyze with LLM
         proposals = await analyze_meeting_with_llm(
             meeting_minutes=analysis_request.meeting_minutes,
             project_key=analysis_request.jira_project_key,
             existing_tickets=existing_tickets
         )
-        
+
         # Create analysis record
         analysis = MeetingAnalysis(
             **analysis_request.model_dump(),
             proposed_changes=proposals
         )
-        
-        doc = analysis.model_dump()
-        doc['created_at'] = doc['created_at'].isoformat()
-        if doc.get('processed_at'):
-            doc['processed_at'] = doc['processed_at'].isoformat()
-        
-        await db.meeting_analyses.insert_one(doc)
-        
+
+        # Save to database
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                '''INSERT INTO meeting_analyses
+                   (id, jira_project_key, client_name, project_name, meeting_minutes,
+                    proposed_changes, status, created_at, processed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (analysis.id, analysis.jira_project_key, analysis.client_name,
+                 analysis.project_name, analysis.meeting_minutes,
+                 json.dumps([p.model_dump() for p in analysis.proposed_changes]),
+                 analysis.status, analysis.created_at.isoformat(), None)
+            )
+            await db.commit()
+
         return {"success": True, "analysis_id": analysis.id, "proposals_count": len(proposals)}
-    
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error creating analysis: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/analysis/{analysis_id}")
 async def get_analysis(analysis_id: str):
     """Get analysis by ID"""
     try:
-        analysis = await db.meeting_analyses.find_one({"id": analysis_id}, {"_id": 0})
-        
-        if not analysis:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
-        return analysis
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM meeting_analyses WHERE id = ?', (analysis_id,)) as cursor:
+                row = await cursor.fetchone()
+
+                if not row:
+                    raise HTTPException(status_code=404, detail="Analysis not found")
+
+                return {
+                    "id": row['id'],
+                    "jira_project_key": row['jira_project_key'],
+                    "client_name": row['client_name'],
+                    "project_name": row['project_name'],
+                    "meeting_minutes": row['meeting_minutes'],
+                    "proposed_changes": json.loads(row['proposed_changes']),
+                    "status": row['status'],
+                    "created_at": row['created_at'],
+                    "processed_at": row['processed_at']
+                }
     except HTTPException:
         raise
     except Exception as e:
@@ -465,8 +547,26 @@ async def get_analysis(analysis_id: str):
 async def get_all_analyses():
     """Get all analyses"""
     try:
-        analyses = await db.meeting_analyses.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
-        return {"analyses": analyses}
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM meeting_analyses ORDER BY created_at DESC LIMIT 100') as cursor:
+                rows = await cursor.fetchall()
+
+                analyses = []
+                for row in rows:
+                    analyses.append({
+                        "id": row['id'],
+                        "jira_project_key": row['jira_project_key'],
+                        "client_name": row['client_name'],
+                        "project_name": row['project_name'],
+                        "meeting_minutes": row['meeting_minutes'],
+                        "proposed_changes": json.loads(row['proposed_changes']),
+                        "status": row['status'],
+                        "created_at": row['created_at'],
+                        "processed_at": row['processed_at']
+                    })
+
+                return {"analyses": analyses}
     except Exception as e:
         logger.error(f"Error fetching analyses: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -476,38 +576,48 @@ async def approve_proposals(analysis_id: str, approval: ApprovalRequest):
     """Approve and execute proposals"""
     try:
         # Get analysis
-        analysis_doc = await db.meeting_analyses.find_one({"id": analysis_id}, {"_id": 0})
-        if not analysis_doc:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
-        analysis = MeetingAnalysis(**analysis_doc)
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM meeting_analyses WHERE id = ?', (analysis_id,)) as cursor:
+                row = await cursor.fetchone()
+
+                if not row:
+                    raise HTTPException(status_code=404, detail="Analysis not found")
+
+                proposed_changes = json.loads(row['proposed_changes'])
+                jira_project_key = row['jira_project_key']
+
         # Get Jira config
-        config = await db.jira_configs.find_one({}, {"_id": 0})
-        if not config:
-            raise HTTPException(status_code=400, detail="Jira not configured")
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM jira_configs LIMIT 1') as cursor:
+                config_row = await cursor.fetchone()
+
+                if not config_row:
+                    raise HTTPException(status_code=400, detail="Jira not configured")
+
         jira_client = JiraAPIClient(
-            domain=config['jira_domain'],
-            email=config['jira_email'],
-            api_token=config['jira_api_token']
+            domain=config_row['jira_domain'],
+            email=config_row['jira_email'],
+            api_token=config_row['jira_api_token']
         )
-        
+
         results = []
-        
+
         # Process approved proposals
         for idx in approval.approved_indices:
-            if idx >= len(analysis.proposed_changes):
+            if idx >= len(proposed_changes):
                 continue
-            
-            proposal = analysis.proposed_changes[idx]
-            
-            if proposal.action == "create":
+
+            proposal = proposed_changes[idx]
+
+            if proposal['action'] == "create":
+                logger.info(f"Creating ticket: {proposal['summary']}")
                 ticket_key = await jira_client.create_ticket(
-                    project_key=analysis.jira_project_key,
-                    issue_type=proposal.issue_type,
-                    summary=proposal.summary,
-                    description=proposal.description
+                    project_key=jira_project_key,
+                    issue_type=proposal['issue_type'],
+                    summary=proposal['summary'],
+                    description=proposal['description']
                 )
                 results.append({
                     "index": idx,
@@ -515,63 +625,71 @@ async def approve_proposals(analysis_id: str, approval: ApprovalRequest):
                     "success": ticket_key is not None,
                     "ticket_key": ticket_key
                 })
-            
-            elif proposal.action == "modify" and proposal.ticket_key:
+
+            elif proposal['action'] == "modify" and proposal.get('ticket_key'):
+                logger.info(f"Updating ticket: {proposal['ticket_key']}")
                 success = await jira_client.update_ticket(
-                    ticket_key=proposal.ticket_key,
-                    summary=proposal.summary,
-                    description=proposal.description
+                    ticket_key=proposal['ticket_key'],
+                    summary=proposal['summary'],
+                    description=proposal['description']
                 )
                 results.append({
                     "index": idx,
                     "action": "modify",
                     "success": success,
-                    "ticket_key": proposal.ticket_key
+                    "ticket_key": proposal['ticket_key']
                 })
-        
+
         # Update analysis status
-        status = "approved" if len(approval.approved_indices) == len(analysis.proposed_changes) else "partially_approved"
-        
-        await db.meeting_analyses.update_one(
-            {"id": analysis_id},
-            {"$set": {
-                "status": status,
-                "processed_at": datetime.now(timezone.utc).isoformat()
-            }}
-        )
-        
+        status = "approved" if len(approval.approved_indices) == len(proposed_changes) else "partially_approved"
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                'UPDATE meeting_analyses SET status = ?, processed_at = ? WHERE id = ?',
+                (status, datetime.now(timezone.utc).isoformat(), analysis_id)
+            )
+            await db.commit()
+
         return {"success": True, "results": results}
-    
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error approving proposals: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.put("/analysis/{analysis_id}/modify")
 async def modify_proposal(analysis_id: str, modification: ModifyProposalRequest):
     """Modify a proposal before approval"""
     try:
-        analysis = await db.meeting_analyses.find_one({"id": analysis_id}, {"_id": 0})
-        if not analysis:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
-        if modification.index >= len(analysis['proposed_changes']):
-            raise HTTPException(status_code=400, detail="Invalid proposal index")
-        
-        update_fields = {}
-        if modification.summary:
-            update_fields[f"proposed_changes.{modification.index}.summary"] = modification.summary
-        if modification.description:
-            update_fields[f"proposed_changes.{modification.index}.description"] = modification.description
-        
-        await db.meeting_analyses.update_one(
-            {"id": analysis_id},
-            {"$set": update_fields}
-        )
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM meeting_analyses WHERE id = ?', (analysis_id,)) as cursor:
+                row = await cursor.fetchone()
+
+                if not row:
+                    raise HTTPException(status_code=404, detail="Analysis not found")
+
+                proposed_changes = json.loads(row['proposed_changes'])
+
+                if modification.index >= len(proposed_changes):
+                    raise HTTPException(status_code=400, detail="Invalid proposal index")
+
+                if modification.summary:
+                    proposed_changes[modification.index]['summary'] = modification.summary
+                if modification.description:
+                    proposed_changes[modification.index]['description'] = modification.description
+
+                await db.execute(
+                    'UPDATE meeting_analyses SET proposed_changes = ? WHERE id = ?',
+                    (json.dumps(proposed_changes), analysis_id)
+                )
+                await db.commit()
+
         return {"success": True, "message": "Proposal updated successfully"}
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -582,14 +700,16 @@ async def modify_proposal(analysis_id: str, modification: ModifyProposalRequest)
 async def delete_analysis(analysis_id: str):
     """Delete/reject an analysis"""
     try:
-        result = await db.meeting_analyses.update_one(
-            {"id": analysis_id},
-            {"$set": {"status": "rejected"}}
-        )
-        
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                'UPDATE meeting_analyses SET status = ? WHERE id = ?',
+                ('rejected', analysis_id)
+            )
+            await db.commit()
+
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Analysis not found")
+
         return {"success": True, "message": "Analysis rejected"}
     except HTTPException:
         raise
@@ -608,6 +728,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    logger.info("Application started successfully")
+
 @app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+async def shutdown_event():
+    logger.info("Application shutting down")
