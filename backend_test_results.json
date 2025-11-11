@@ -1,0 +1,80 @@
+{
+  "timestamp": "2025-11-11T11:22:24.104237",
+  "summary": {
+    "passed": 13,
+    "total": 14,
+    "success_rate": 92.85714285714286
+  },
+  "results": [
+    {
+      "test": "Root API Endpoint",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Jira Config (Empty)",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Save Jira Config",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get Jira Config (After Save)",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Test Jira Connection",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Create Analysis",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Analysis ID Retrieved",
+      "success": true,
+      "details": "ID: 02720fd1-ce3b-452c-a3c9-a2619a83c731"
+    },
+    {
+      "test": "Get Analysis by ID",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Get All Analyses",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Modify Proposal",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Approve Proposals",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Reject Analysis",
+      "success": true,
+      "details": "Status: 200"
+    },
+    {
+      "test": "Invalid Analysis ID",
+      "success": true,
+      "details": "Status: 404"
+    },
+    {
+      "test": "Analysis Without Valid Jira",
+      "success": false,
+      "details": "Status: 422, Error: [{'type': 'missing', 'loc': ['body'], 'msg': 'Field required', 'input': None, 'url': 'https://errors.pydantic.dev/2.12/v/missing'}]"
+    }
+  ]
+}
