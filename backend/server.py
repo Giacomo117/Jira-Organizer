@@ -9,10 +9,10 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 import json
 import aiohttp
 from base64 import b64encode
+from openai import AsyncAzureOpenAI
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -249,14 +249,14 @@ class JiraAPIClient:
 # ==================== LLM Analysis Service ====================
 
 async def analyze_meeting_with_llm(meeting_minutes: str, project_key: str, existing_tickets: List[Dict]) -> List[ProposedTicket]:
-    """Use LLM to analyze meeting minutes and propose Jira changes"""
+    """Use Azure OpenAI to analyze meeting minutes and propose Jira changes"""
     try:
         # Format existing tickets for the LLM
         tickets_summary = "\n".join([
             f"- {ticket['key']}: [{ticket['fields']['issuetype']['name']}] {ticket['fields']['summary']}\n  Description: {ticket['fields'].get('description', {}).get('content', [{}])[0].get('content', [{}])[0].get('text', 'No description')[:200]}"
             for ticket in existing_tickets[:50]  # Limit to avoid token overflow
         ])
-        
+
         system_message = """You are a Jira project management assistant. Your task is to analyze meeting minutes and compare them with existing Jira tickets to identify:
 1. New tasks, stories, or bugs that should be created
 2. Existing tickets that need to be updated based on meeting decisions
@@ -274,7 +274,7 @@ You must respond ONLY with a valid JSON array of proposed changes. Each change m
 }
 
 IMPORTANT: Respond with ONLY a JSON array, no additional text or explanation."""
-        
+
         user_prompt = f"""Project: {project_key}
 
 Existing Tickets:
@@ -284,42 +284,53 @@ Meeting Minutes:
 {meeting_minutes}
 
 Analyze the meeting minutes and propose changes as a JSON array."""
-        
-        # Initialize LLM chat
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message=system_message
-        ).with_model("openai", "gpt-4o")
-        
-        # Send message
-        user_message = UserMessage(text=user_prompt)
-        response = await chat.send_message(user_message)
-        
-        logger.info(f"LLM Response: {response}")
-        
+
+        # Initialize Azure OpenAI client
+        azure_client = AsyncAzureOpenAI(
+            api_key=os.environ.get('AZURE_OPENAI_API_KEY'),
+            api_version=os.environ.get('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'),
+            azure_endpoint=os.environ.get('AZURE_OPENAI_ENDPOINT')
+        )
+
+        # Get deployment name from environment
+        deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')
+
+        # Send message to Azure OpenAI
+        response = await azure_client.chat.completions.create(
+            model=deployment_name,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=4000
+        )
+
+        response_text = response.choices[0].message.content
+        logger.info(f"Azure OpenAI Response: {response_text}")
+
         # Parse response
         # Remove markdown code blocks if present
-        response_text = response.strip()
         if response_text.startswith("```"):
             lines = response_text.split("\n")
             response_text = "\n".join(lines[1:-1]) if len(lines) > 2 else response_text
             response_text = response_text.replace("```json", "").replace("```", "")
-        
-        proposals_data = json.loads(response_text)
-        
+
+        proposals_data = json.loads(response_text.strip())
+
         # Convert to ProposedTicket objects
         proposals = [ProposedTicket(**item) for item in proposals_data]
-        
+
         return proposals
-    
+
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse LLM response as JSON: {e}")
-        logger.error(f"Response was: {response}")
+        logger.error(f"Response was: {response_text if 'response_text' in locals() else 'No response'}")
         return []
     except Exception as e:
-        logger.error(f"Error in LLM analysis: {e}")
+        logger.error(f"Error in Azure OpenAI analysis: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 # ==================== API Routes ====================
