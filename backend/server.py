@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import json
 import aiohttp
 from base64 import b64encode
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 import aiosqlite
 import asyncio
 
@@ -282,7 +282,7 @@ class JiraAPIClient:
 # ==================== LLM Analysis Service ====================
 
 async def analyze_meeting_with_llm(meeting_minutes: str, project_key: str, existing_tickets: List[Dict]) -> List[ProposedTicket]:
-    """Use Azure OpenAI to analyze meeting minutes and propose Jira changes"""
+    """Use OpenRouter (GPT-4o) to analyze meeting minutes and propose Jira changes"""
     try:
         # Format existing tickets for the LLM
         tickets_summary = "\n".join([
@@ -318,21 +318,18 @@ Meeting Minutes:
 
 Analyze the meeting minutes and propose changes as a JSON array."""
 
-        # Initialize Azure OpenAI client
-        azure_client = AsyncAzureOpenAI(
-            api_key=os.environ.get('AZURE_OPENAI_API_KEY'),
-            api_version=os.environ.get('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'),
-            azure_endpoint=os.environ.get('AZURE_OPENAI_ENDPOINT')
+        # Initialize OpenRouter client
+        client = AsyncOpenAI(
+            api_key=os.environ.get('OPENROUTER_API_KEY'),
+            base_url="https://openrouter.ai/api/v1"
         )
 
-        # Get deployment name from environment
-        deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')
+        model_name = os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o')
+        logger.info(f"Calling OpenRouter with model: {model_name}")
 
-        logger.info(f"Calling Azure OpenAI with deployment: {deployment_name}")
-
-        # Send message to Azure OpenAI
-        response = await azure_client.chat.completions.create(
-            model=deployment_name,
+        # Send message to OpenRouter
+        response = await client.chat.completions.create(
+            model=model_name,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_prompt}
@@ -342,7 +339,7 @@ Analyze the meeting minutes and propose changes as a JSON array."""
         )
 
         response_text = response.choices[0].message.content
-        logger.info(f"Azure OpenAI Response: {response_text[:500]}...")
+        logger.info(f"OpenRouter Response: {response_text[:500]}...")
 
         # Parse response
         # Remove markdown code blocks if present
@@ -364,7 +361,7 @@ Analyze the meeting minutes and propose changes as a JSON array."""
         logger.error(f"Response was: {response_text if 'response_text' in locals() else 'No response'}")
         return []
     except Exception as e:
-        logger.error(f"Error in Azure OpenAI analysis: {e}")
+        logger.error(f"Error in OpenRouter API call: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return []
