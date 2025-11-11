@@ -62,7 +62,12 @@ export default function Configuration() {
     setTestResult(null);
 
     try {
-      const response = await axios.post(`${API}/jira/test-connection`);
+      // Test with current form values instead of saved config
+      const response = await axios.post(`${API}/jira/test-credentials`, {
+        jira_domain: formData.jira_domain,
+        jira_email: formData.jira_email,
+        jira_api_token: formData.jira_api_token
+      });
       setTestResult(response.data);
       if (response.data.success) {
         toast.success('Connection test successful!');

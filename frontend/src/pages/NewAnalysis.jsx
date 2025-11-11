@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -6,6 +6,10 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Check, ChevronsUpDown } from 'lucide-react';
 import { toast } from 'sonner';
 import { Loader2, FileText } from 'lucide-react';
 
@@ -21,6 +25,58 @@ export default function NewAnalysis() {
     meeting_minutes: '',
   });
   const [loading, setLoading] = useState(false);
+  const [projects, setProjects] = useState([]);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [clientNames, setClientNames] = useState([]);
+  const [projectNames, setProjectNames] = useState([]);
+  const [loadingOptions, setLoadingOptions] = useState(true);
+  const [openClient, setOpenClient] = useState(false);
+  const [openProject, setOpenProject] = useState(false);
+
+  const fetchProjects = async () => {
+    try {
+      const response = await axios.get(`${API}/jira/projects`);
+      setProjects(response.data.projects);
+    } catch (error) {
+      console.error('Error fetching projects:', error);
+      toast.error('Failed to load Jira projects. Please check your Jira configuration.');
+    } finally {
+      setLoadingProjects(false);
+    }
+  };
+
+  const fetchClientNames = async () => {
+    try {
+      const response = await axios.get(`${API}/analysis/client-names`);
+      setClientNames(response.data.client_names);
+    } catch (error) {
+      console.error('Error fetching client names:', error);
+      // Non mostriamo errore per questo, potrebbe essere vuoto
+    }
+  };
+
+  const fetchProjectNames = async () => {
+    try {
+      const response = await axios.get(`${API}/analysis/project-names`);
+      setProjectNames(response.data.project_names);
+    } catch (error) {
+      console.error('Error fetching project names:', error);
+      // Non mostriamo errore per questo, potrebbe essere vuoto
+    }
+  };
+
+  const fetchData = async () => {
+    await Promise.all([
+      fetchProjects(),
+      fetchClientNames(),
+      fetchProjectNames()
+    ]);
+    setLoadingOptions(false);
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -58,43 +114,123 @@ export default function NewAnalysis() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-2">
                 <Label htmlFor="jira_project_key">Jira Project Key *</Label>
-                <Input
-                  id="jira_project_key"
-                  data-testid="input-project-key"
-                  placeholder="e.g., PROJ"
-                  value={formData.jira_project_key}
-                  onChange={(e) => setFormData({ ...formData, jira_project_key: e.target.value.toUpperCase() })}
-                  required
-                  className="h-12"
-                />
-                <p className="text-sm text-slate-500">The key identifier for your Jira project</p>
+                <Select 
+                  value={formData.jira_project_key} 
+                  onValueChange={(value) => setFormData({ ...formData, jira_project_key: value })}
+                  disabled={loadingProjects}
+                >
+                  <SelectTrigger className="h-12">
+                    <SelectValue placeholder={loadingProjects ? "Loading projects..." : "Select a project"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {projects.map((project) => (
+                      <SelectItem key={project.key} value={project.key}>
+                        <div className="flex flex-col">
+                          <span className="font-medium">{project.key}</span>
+                          <span className="text-sm text-slate-500">{project.name}</span>
+                        </div>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-sm text-slate-500">Select your Jira project from the available options</p>
               </div>
 
               <div className="space-y-2">
                 <Label htmlFor="client_name">Client Name *</Label>
-                <Input
-                  id="client_name"
-                  data-testid="input-client-name"
-                  placeholder="e.g., Acme Corp"
-                  value={formData.client_name}
-                  onChange={(e) => setFormData({ ...formData, client_name: e.target.value })}
-                  required
-                  className="h-12"
-                />
+                <Popover open={openClient} onOpenChange={setOpenClient}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={openClient}
+                      className="h-12 w-full justify-between"
+                    >
+                      {formData.client_name || "Select or type client name..."}
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-full p-0">
+                    <Command>
+                      <CommandInput 
+                        placeholder="Search or type client name..." 
+                        value={formData.client_name}
+                        onValueChange={(value) => setFormData({ ...formData, client_name: value })}
+                      />
+                      <CommandList>
+                        <CommandEmpty>No client found. Press Enter to use current input.</CommandEmpty>
+                        <CommandGroup>
+                          {clientNames.map((name) => (
+                            <CommandItem
+                              key={name}
+                              value={name}
+                              onSelect={(currentValue) => {
+                                setFormData({ ...formData, client_name: currentValue });
+                                setOpenClient(false);
+                              }}
+                            >
+                              <Check
+                                className={`mr-2 h-4 w-4 ${
+                                  formData.client_name === name ? "opacity-100" : "opacity-0"
+                                }`}
+                              />
+                              {name}
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
               </div>
             </div>
 
             <div className="space-y-2">
               <Label htmlFor="project_name">Project Name *</Label>
-              <Input
-                id="project_name"
-                data-testid="input-project-name"
-                placeholder="e.g., Mobile App Redesign"
-                value={formData.project_name}
-                onChange={(e) => setFormData({ ...formData, project_name: e.target.value })}
-                required
-                className="h-12"
-              />
+              <Popover open={openProject} onOpenChange={setOpenProject}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    role="combobox"
+                    aria-expanded={openProject}
+                    className="h-12 w-full justify-between"
+                  >
+                    {formData.project_name || "Select or type project name..."}
+                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-full p-0">
+                  <Command>
+                    <CommandInput 
+                      placeholder="Search or type project name..." 
+                      value={formData.project_name}
+                      onValueChange={(value) => setFormData({ ...formData, project_name: value })}
+                    />
+                    <CommandList>
+                      <CommandEmpty>No project found. Press Enter to use current input.</CommandEmpty>
+                      <CommandGroup>
+                        {projectNames.map((name) => (
+                          <CommandItem
+                            key={name}
+                            value={name}
+                            onSelect={(currentValue) => {
+                              setFormData({ ...formData, project_name: currentValue });
+                              setOpenProject(false);
+                            }}
+                          >
+                            <Check
+                              className={`mr-2 h-4 w-4 ${
+                                formData.project_name === name ? "opacity-100" : "opacity-0"
+                              }`}
+                            />
+                            {name}
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
             </div>
 
             <div className="space-y-2">

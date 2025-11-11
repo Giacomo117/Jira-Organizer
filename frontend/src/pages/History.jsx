@@ -98,14 +98,12 @@ export default function History() {
                     </div>
                   </div>
                   
-                  {analysis.status === 'pending' && (
-                    <Link to={`/review/${analysis.id}`}>
-                      <Button data-testid={`review-btn-${analysis.id}`} size="sm" className="bg-blue-600 hover:bg-blue-700">
-                        <Eye className="w-4 h-4 mr-2" />
-                        Review
-                      </Button>
-                    </Link>
-                  )}
+                  <Link to={`/review/${analysis.id}`}>
+                    <Button data-testid={`review-btn-${analysis.id}`} size="sm" className="bg-blue-600 hover:bg-blue-700">
+                      <Eye className="w-4 h-4 mr-2" />
+                      {analysis.status === 'pending' ? 'Review' : 'View Details'}
+                    </Button>
+                  </Link>
                 </div>
               </CardHeader>
               <CardContent>

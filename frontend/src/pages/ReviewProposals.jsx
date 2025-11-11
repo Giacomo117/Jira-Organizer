@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from 'sonner';
-import { CheckCircle2, XCircle, Edit2, FileText, AlertCircle, Loader2 } from 'lucide-react';
+import { CheckCircle2, XCircle, Edit2, FileText, AlertCircle, Loader2, Layers, BookOpen, Settings, Wrench, Bug } from 'lucide-react';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 
@@ -22,6 +22,47 @@ export default function ReviewProposals() {
   const [processing, setProcessing] = useState(false);
   const [editingIndex, setEditingIndex] = useState(null);
   const [editForm, setEditForm] = useState({ summary: '', description: '' });
+
+  const getIssueTypeIcon = (issueType) => {
+    switch (issueType.toLowerCase()) {
+      case 'epic':
+        return <Layers className="w-4 h-4 text-purple-600" />;
+      case 'story':
+        return <BookOpen className="w-4 h-4 text-blue-600" />;
+      case 'task':
+        return <Settings className="w-4 h-4 text-green-600" />;
+      case 'subtask':
+      case 'sub-task':
+        return <Wrench className="w-4 h-4 text-orange-600" />;
+      case 'bug':
+        return <Bug className="w-4 h-4 text-red-600" />;
+      default:
+        return <FileText className="w-4 h-4 text-gray-600" />;
+    }
+  };
+
+  const getHierarchyIndent = (proposal) => {
+    if (!proposal.parent_summary) return 0;
+    if (proposal.issue_type.toLowerCase() === 'story') return 1; // Under Epic
+    if (proposal.issue_type.toLowerCase() === 'task') return 1; // Under Epic or Story
+    if (proposal.issue_type.toLowerCase() === 'subtask' || proposal.issue_type.toLowerCase() === 'sub-task') return 2; // Under Task/Story
+    return 0;
+  };
+
+  const organizeProposalsByHierarchy = (proposals) => {
+    // Sort by hierarchy: Epic first, then Story, then Task/Subtask
+    const hierarchy = { 'epic': 0, 'story': 1, 'task': 2, 'subtask': 3, 'sub-task': 3, 'bug': 4 };
+    return proposals.map((proposal, index) => ({ ...proposal, originalIndex: index }))
+      .sort((a, b) => {
+        const aLevel = hierarchy[a.issue_type.toLowerCase()] || 5;
+        const bLevel = hierarchy[b.issue_type.toLowerCase()] || 5;
+        if (aLevel !== bLevel) return aLevel - bLevel;
+        // If same level, sort by parent relationship
+        if (a.parent_summary && !b.parent_summary) return 1;
+        if (!a.parent_summary && b.parent_summary) return -1;
+        return 0;
+      });
+  };
 
   useEffect(() => {
     fetchAnalysis();
@@ -176,13 +217,17 @@ export default function ReviewProposals() {
       </Card>
 
       <div className="space-y-4 mb-6">
-        {analysis.proposed_changes.map((proposal, index) => (
+        {organizeProposalsByHierarchy(analysis.proposed_changes).map((proposal) => {
+          const index = proposal.originalIndex;
+          const indentLevel = getHierarchyIndent(proposal);
+          return (
           <Card
             key={index}
             data-testid={`proposal-${index}`}
             className={`shadow-lg border-2 transition-all duration-200 ${
               selectedIndices.includes(index) ? 'border-blue-500 bg-blue-50/30' : 'border-slate-200'
             }`}
+            style={{ marginLeft: `${indentLevel * 2}rem` }}
           >
             <CardHeader>
               <div className="flex items-start justify-between">
@@ -201,7 +246,10 @@ export default function ReviewProposals() {
                       >
                         {proposal.action === 'create' ? 'Create New' : 'Modify Existing'}
                       </Badge>
-                      <Badge variant="outline">{proposal.issue_type}</Badge>
+                      <Badge variant="outline" className="flex items-center gap-1">
+                        {getIssueTypeIcon(proposal.issue_type)}
+                        {proposal.issue_type}
+                      </Badge>
                       {proposal.ticket_key && (
                         <Badge variant="outline" className="font-mono">{proposal.ticket_key}</Badge>
                       )}
@@ -242,6 +290,29 @@ export default function ReviewProposals() {
                     ) : (
                       <>
                         <h3 className="text-lg font-semibold text-slate-900 mb-2">{proposal.summary}</h3>
+                        {proposal.parent_summary && (
+                          <div className="mb-2 text-xs text-slate-500">
+                            └─ Child of: <span className="font-semibold">{proposal.parent_summary}</span>
+                          </div>
+                        )}
+                        {(proposal.story_points || proposal.priority) && (
+                          <div className="flex gap-2 mb-2">
+                            {proposal.story_points && (
+                              <Badge variant="secondary" className="text-xs">
+                                {proposal.story_points} SP
+                              </Badge>
+                            )}
+                            {proposal.priority && (
+                              <Badge variant="secondary" className={`text-xs ${
+                                proposal.priority.toLowerCase() === 'high' ? 'bg-red-100 text-red-800' :
+                                proposal.priority.toLowerCase() === 'medium' ? 'bg-yellow-100 text-yellow-800' :
+                                'bg-green-100 text-green-800'
+                              }`}>
+                                {proposal.priority} Priority
+                              </Badge>
+                            )}
+                          </div>
+                        )}
                         <p className="text-sm text-slate-600 mb-3">{proposal.description}</p>
                         
                         {proposal.current_summary && (
@@ -275,7 +346,8 @@ export default function ReviewProposals() {
               </div>
             </CardHeader>
           </Card>
-        ))}
+        );
+        })}
       </div>
 
       <Card className="shadow-xl border-slate-200">
